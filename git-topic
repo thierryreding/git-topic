@@ -1,0 +1,538 @@
+#!/bin/sh
+
+prefix=staging/
+remote=staging/
+
+git_find_tree()
+{
+	commit="$1"
+
+	git cat-file -p $commit | while read type hash; do
+		if test "x$type" = "xtree"; then
+			echo "$hash"
+			return
+		fi
+	done
+}
+
+git_find_object()
+{
+	tree="$1"
+	path="$2"
+
+	git cat-file -p $tree | while read mode type hash name; do
+		if test "x$name" = "x$path"; then
+			echo "$hash"
+			return
+		fi
+	done
+}
+
+git_find_blob()
+{
+	commit="$1"
+	path="$2"
+
+	tree=$(git_find_tree $commit)
+
+	for name in $(echo "$path" | tr "/" " "); do
+		hash=$(git_find_object "$tree" "$name")
+		type=$(git cat-file -t "$hash")
+		if test "x$type" = "xtree"; then
+			tree="$hash"
+		fi
+	done
+
+	echo "$hash"
+}
+
+git_branch_exists()
+{
+	for branch in "$@"; do
+		if ! git rev-parse --verify --quiet $1 > /dev/null 2>&1; then
+			return 1
+		fi
+	done
+}
+
+git_topic_list_branches()
+{
+	parent="$(git show-ref --heads --hash ${prefix}branches)"
+
+	if test -n "$parent"; then
+		prev=$(git_find_blob "$parent" branches)
+		git cat-file -p "$prev"
+	fi
+}
+
+git_topic_check_sanity()
+{
+	fatal="$1"
+	errors=no
+
+	branch="$(git show-ref --heads --hash ${prefix}branches)"
+	if test "x$branch" = "x"; then
+		echo "ERROR: branch ${prefix}branches does not exist, try running:"
+		echo "    $ git topic branches"
+
+		if test "x$fatal" = "xno"; then
+			return 1
+		else
+			exit 1
+		fi
+	fi
+
+	hash=$(git_find_blob ${prefix}branches branches)
+	if test "x$hash" = "x"; then
+		echo "ERROR: no topic branches defined, try running:"
+		echo "    $ git topic branches"
+
+		if test "x$fatal" = "xno"; then
+			return 1
+		else
+			exit 1
+		fi
+	fi
+
+	git_topic_list_branches | while read branch; do
+		case $branch in
+			branches | base | master | master-old | work)
+				echo "ERROR: branch ${branch} is special and can't be used as topic branch"
+				errors=yes
+				;;
+
+			*)
+				;;
+		esac
+	done
+
+	if test "x$errors" = "xyes"; then
+		if test "x$fatal" = "xno"; then
+			return 1
+		else
+			exit 1
+		fi
+	fi
+}
+
+init()
+{
+	if test "x$2" = "x"; then
+		echo "usage: git topic $0 BASE"
+		return
+	fi
+
+	if git_branch_exists ${prefix}base ${prefix}master; then
+		echo "already initialized"
+		return
+	fi
+
+	git branch ${prefix}base $2
+	git branch ${prefix}master $2
+}
+
+branches()
+{
+	parent="$(git show-ref --heads --hash ${prefix}branches)"
+	branches="$(mktemp)"
+	message="$(mktemp)"
+
+	if test -n "$parent"; then
+		prev=$(git_find_blob "$parent" branches)
+		git cat-file -p "$prev" > "$branches"
+	fi
+
+	$EDITOR "$branches"
+
+	hash=$(git hash-object -t blob -w --path branches "$branches")
+
+	if test "x$hash" = "x$prev"; then
+		echo "No changes to commit."
+		rm "$message" "$branches"
+		return
+	fi
+
+	tree=$(echo -e "100644 blob $hash\tbranches" | git mktree)
+
+	echo -ne "\n\n" > "$message"
+
+	if test -n "$parent"; then
+		prev=$(git_find_tree "$parent")
+		git diff-tree --patch-with-stat "$prev" "$tree" | while read line; do
+			echo "# $line"
+		done >> "$message"
+	else
+		echo "# Initial commit." >> "$message"
+	fi
+
+	$EDITOR "$message"
+
+	if test -n "$parent"; then
+		hash=$(sed '/^#/d' < "$message" | git commit-tree -p "$parent" "$tree")
+	else
+		hash=$(sed '/^#/d' < "$message" | git commit-tree "$tree")
+	fi
+
+	echo "Updating refs/heads/${prefix}branches to $hash"
+	git update-ref refs/heads/${prefix}branches "$hash"
+
+	rm "$message" "$branches"
+}
+
+sanity()
+{
+	if git_topic_check_sanity no; then
+		echo "Sanity checks passed."
+		return 0
+	else
+		return 1
+	fi
+}
+
+rebase()
+{
+	dry_run=no
+	shift;
+
+	if test -d .git/rebase-apply; then
+		echo "directory .git/rebase-apply exists, rebase in progress?"
+		return 1
+	fi
+
+	if ! git_branch_exists ${prefix}base ${prefix}master; then
+		echo "topic branches not initialized, run git topic init first"
+		return
+	fi
+
+	while test "$#" -gt 0; do
+		case $1 in
+			-n | --dry-run)
+				dry_run=yes
+				shift
+				;;
+
+			*)
+				new=$1
+				old=$2
+				break
+				;;
+		esac
+	done
+
+	if test -z "$old"; then
+		old=${prefix}base
+	fi
+
+	if test -z "$new"; then
+		new=${prefix}base
+	fi
+
+	if ! git rev-parse --verify --quiet $old > /dev/null 2>&1; then
+		echo "ERROR: old base ($old) not found"
+		return 1
+	fi
+
+	if ! git rev-parse --verify --quiet $new > /dev/null 2>&1; then
+		echo "ERROR: new base ($new) not found"
+		return 1
+	fi
+
+	oldref=$(git rev-parse --symbolic-full-name $old)
+	oldhash=$(git rev-parse $oldref)
+
+	newref=$(git rev-parse --symbolic-full-name $new)
+
+	if git show-ref --dereference $new > /dev/null 2>&1; then
+		newhash=$(git rev-parse $newref^{commit})
+	else
+		newhash=$(git rev-parse $newref)
+	fi
+
+	if ! git diff --quiet || ! git diff --cached --quiet; then
+		dirty=yes
+	else
+		dirty=no
+	fi
+
+	if test "x$dirty" = "xyes"; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git stash"
+		else
+			git stash
+		fi
+	fi
+
+	if test "x$newhash" != "x$oldhash"; then
+		git_topic_list_branches | while read branch; do
+			if test "x${branch###}" != "x${branch}"; then
+				continue
+			fi
+
+			branch=${prefix}$branch
+
+			echo "rebasing $branch onto $newref (old: $oldref)"
+
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git checkout $branch"
+			else
+				git checkout $branch
+			fi
+
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git rebase --onto $newref $oldref"
+			else
+				if ! git rebase --onto $newref $oldref; then
+					$SHELL <&- < /dev/tty
+				fi
+			fi
+		done
+
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git branch -D ${prefix}base"
+			echo "running: git branch ${prefix}base $newref"
+		else
+			git branch -D ${prefix}base
+			git branch ${prefix}base $newref
+		fi
+	else
+		echo "$oldref and $newref are the same, rebasing skipped"
+	fi
+
+	if test "x$dry_run" = "xyes"; then
+		if ! git_branch_exists ${prefix}master; then
+			echo "running: git branch ${prefix}master ${prefix}base"
+		fi
+
+		echo "running: git checkout ${prefix}master"
+		echo "running: git branch ${prefix}master-old"
+		echo "running: git reset --hard $newref"
+	else
+		if ! git_branch_exists ${prefix}master; then
+			git branch ${prefix}master ${prefix}base
+		fi
+
+		git checkout ${prefix}master
+		git branch ${prefix}master-old
+		git reset --hard $newref
+	fi
+
+	git_topic_list_branches | while read branch; do
+		if test "x${branch###}" != "x${branch}"; then
+			continue
+		fi
+
+		branch=${prefix}$branch
+
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git merge --no-ff $branch"
+		else
+			echo "merging $branch into ${prefix}master"
+
+			if ! git merge --no-ff $branch; then
+				$SHELL <&- < /dev/tty
+			fi
+		fi
+	done
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git checkout --quiet ${prefix}work"
+		echo "running: git rebase --onto ${prefix}master ${prefix}master-old"
+	else
+		if git checkout --quiet ${prefix}work 2> /dev/null; then
+			if ! git rebase --onto ${prefix}master ${prefix}master-old; then
+				$SHELL <&- < /dev/tty
+			fi
+		else
+			# create an empty work branch
+			git checkout -b ${prefix}work ${prefix}master
+		fi
+	fi
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git branch -D ${prefix}master-old"
+	else
+		git branch -D ${prefix}master-old
+	fi
+
+	if test "x$dirty" = "xyes"; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git stash pop"
+		else
+			git stash pop
+		fi
+	fi
+
+	echo "git-topic: rebase: all done"
+}
+
+git_topic_push_list()
+{
+	git_topic_list_branches | while read branch; do
+		if test "x${branch###}" = "x${branch}"; then
+			echo -n "${sep}${prefix}${branch}:${remote}${branch}"
+			sep=' '
+		fi
+	done
+}
+
+push()
+{
+	shift
+
+	while test "$#" -gt 0; do
+		case $1 in
+			-n | --dry-run)
+				args="$args --dry-run"
+				shift
+				;;
+
+			-f | --force)
+				args="$args --force"
+				shift
+				;;
+
+			-* | --*)
+				echo "push: unknown option $1"
+				exit 1
+				;;
+
+			*)
+				repository="$1"
+				shift
+				break
+				;;
+		esac
+	done
+
+	if test "x$repository" = "x"; then
+		echo "usage: git topic push [options] REPOSITORY"
+		exit 1
+	fi
+
+	branches="${prefix}branches:${remote}branches ${prefix}base:${remote}base"
+	branches="$branches $(git_topic_push_list)"
+	branches="$branches ${prefix}master:${remote}master"
+	branches="$branches ${prefix}work:${remote}work"
+
+	echo "pushing $branches to $repository"
+	git push $args $repository $branches
+}
+
+git_topic_delete_list()
+{
+	git_topic_list_branches | while read branch; do
+		if test "x${branch###}" = "x${branch}"; then
+			echo -n "${sep}${remote}${branch}"
+			sep=' '
+		fi
+	done
+}
+
+delete()
+{
+	shift
+
+	while test "$#" -gt 0; do
+		case $1 in
+			-n | --dry-run)
+				args="$args --dry-run"
+				shift
+				;;
+
+			-* | --*)
+				echo "delete: unknown option $1"
+				exit 1
+				;;
+
+			*)
+				repository="$1"
+				shift
+				break
+				;;
+		esac
+	done
+
+	if test "x$remote" = "x"; then
+		echo "usage: git topic delete [options] REMOTE"
+		exit 1
+	fi
+
+	args="$args --delete"
+
+	branches="${remote}branches ${remote}base"
+	branches="$branches $(git_topic_delete_list)"
+	branches="$branches ${remote}master ${remote}work"
+
+	echo "deleting $branches from $repository"
+	git push $args $repository $branches
+}
+
+usage()
+{
+	echo "usage: git topic [command]"
+}
+
+while test $# -gt 0; do
+	if test -n "$prev"; then
+		eval "$prev=$1"
+		shift; prev=
+		continue
+	fi
+
+	case $1 in
+		--prefix)
+			prev=prefix
+			shift
+			;;
+
+		*)
+			break
+			;;
+	esac
+done
+
+remote=${prefix##*:}
+prefix=${prefix%%:*}
+
+case $1 in
+	init | branches | sanity)
+		;;
+
+	*)
+		if ! git_topic_check_sanity yes; then
+			exit 1
+		fi
+		;;
+esac
+
+case $1 in
+	init)
+		init "$@"
+		;;
+
+	branches)
+		branches "$@"
+		;;
+
+	sanity)
+		sanity "$@"
+		;;
+
+	rebase)
+		rebase "$@"
+		;;
+
+	push)
+		push "$@"
+		;;
+
+	delete)
+		delete "$@"
+		;;
+
+	*)
+		usage $0
+		;;
+esac
+
+exit $?
