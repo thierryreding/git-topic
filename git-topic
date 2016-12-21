@@ -420,6 +420,172 @@ push()
 	git push $args $repository $branches
 }
 
+sync()
+{
+	local dry_run=no
+	shift
+
+	while test "$#" -gt 0; do
+		case $1 in
+			-n | --dry-run)
+				dry_run=yes
+				shift
+				;;
+
+			*)
+				repository="$1"
+				shift
+				break
+				;;
+		esac
+	done
+
+	if test "x$repository" = "x"; then
+		echo "usage: git topic sync [options] REPOSITORY"
+		exit 1
+	fi
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git fetch $repository"
+	else
+		git fetch $repository
+	fi
+
+	if ! git diff --quiet || ! git diff --cached --quiet; then
+		dirty=yes
+	else
+		dirty=no
+	fi
+
+	if test "x$dirty" = "xyes"; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git stash"
+		else
+			git stash
+		fi
+	fi
+
+	for branch in branches base; do
+		if ! git_branch_exists ${prefix}$branch; then
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git checkout -b ${prefix}$branch ${repository}/${remote}$branch"
+			else
+				git checkout -b ${prefix}$branch ${repository}/${remote}$branch
+			fi
+		else
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git checkout ${prefix}$branch"
+				echo "running: git rebase"
+			else
+				git checkout ${prefix}$branch
+
+				if ! git rebase; then
+					$SHELL <&- < /dev/tty
+				fi
+			fi
+		fi
+	done
+
+	git_topic_list_branches | while read branch; do
+		if test "x${branch###}" != "x${branch}"; then
+			continue
+		fi
+
+		if ! git_branch_exists ${prefix}$branch; then
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git checkout -b ${prefix}$branch ${repository}/${remote}$branch"
+			else
+				git checkout -b ${prefix}$branch ${repository}/${remote}$branch
+			fi
+		else
+			if test "x$dry_run" = "xyes"; then
+				echo "running: git checkout ${prefix}$branch"
+				echo "running: git rebase"
+			else
+				git checkout ${prefix}$branch
+
+				if ! git rebase; then
+					$SHELL <&- < /dev/tty
+				fi
+			fi
+		fi
+	done
+
+	if ! git_branch_exists ${prefix}master; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git checkout -b ${prefix}master ${prefix}base"
+			echo "running: git branch ${prefix}master-old"
+		else
+			git checkout -b ${prefix}master ${prefix}base
+			git branch ${prefix}master-old
+		fi
+	else
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git checkout ${prefix}master"
+			echo "running: git branch ${prefix}master-old"
+			echo "running: git reset --hard ${prefix}base"
+		else
+			git checkout ${prefix}master
+			git branch ${prefix}master-old
+			git reset --hard ${prefix}base
+		fi
+	fi
+
+	git_topic_list_branches | while read branch; do
+		if test "x${branch###}" != "x${branch}"; then
+			continue
+		fi
+
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git merge --no-ff ${prefix}$branch"
+		else
+			echo "merging ${prefix}$branch into ${prefix}master"
+
+			if ! git merge --no-ff ${prefix}$branch; then
+				$SHELL <&- < /dev/tty
+			fi
+		fi
+	done
+
+	if ! git_branch_exists ${prefix}work; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git checkout -b ${prefix}work ${repository}/${remote}work"
+		else
+			git checkout -b ${prefix}work ${repository}/${remote}work
+		fi
+	else
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git checkout ${prefix}work"
+		else
+			git checkout ${prefix}work
+		fi
+	fi
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git rebase --onto ${prefix}master ${prefix}master-old"
+	else
+		if ! git rebase --onto ${prefix}master ${prefix}master-old; then
+			$SHELL <$- < /dev/tty
+		fi
+	fi
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git branch -D ${prefix}master-old"
+	else
+		git branch -D ${prefix}master-old
+	fi
+
+	if test "x$dirty" = "xyes"; then
+		if test "x$dry_run" = "xyes"; then
+			echo "running: git stash pop"
+		else
+			git stash pop
+		fi
+	fi
+
+	echo "git-topic: sync: all done"
+}
+
 git_topic_delete_list()
 {
 	git_topic_list_branches | while read branch; do
@@ -497,7 +663,7 @@ remote=${prefix##*:}
 prefix=${prefix%%:*}
 
 case $1 in
-	init | branches | sanity)
+	init | branches | sanity | sync)
 		;;
 
 	*)
@@ -526,6 +692,10 @@ case $1 in
 
 	push)
 		push "$@"
+		;;
+
+	sync)
+		sync "$@"
 		;;
 
 	delete)
