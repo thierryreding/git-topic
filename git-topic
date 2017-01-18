@@ -465,6 +465,12 @@ sync()
 		fi
 	fi
 
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git branch ${prefix}base ${prefix}base-old"
+	else
+		git branch ${prefix}base-old ${prefix}base
+	fi
+
 	for branch in branches base; do
 		if ! git_branch_exists ${prefix}$branch; then
 			if test "x$dry_run" = "xyes"; then
@@ -474,12 +480,9 @@ sync()
 			fi
 		else
 			if test "x$dry_run" = "xyes"; then
-				echo "running: git checkout ${prefix}$branch"
-				echo "running: git rebase"
+				echo "running: git rebase ${repository}/${remote}${branch} ${prefix}$branch"
 			else
-				git checkout ${prefix}$branch
-
-				if ! git rebase; then
+				if ! git rebase ${repository}/${remote}${branch} ${prefix}$branch; then
 					$SHELL <&- < /dev/tty
 				fi
 			fi
@@ -499,17 +502,20 @@ sync()
 			fi
 		else
 			if test "x$dry_run" = "xyes"; then
-				echo "running: git checkout ${prefix}$branch"
-				echo "running: git rebase"
+				echo "running: git rebase --onto ${prefix}base ${prefix}base-old ${prefix}$branch"
 			else
-				git checkout ${prefix}$branch
-
-				if ! git rebase; then
+				if ! git rebase --onto ${prefix}base ${prefix}base-old ${prefix}$branch; then
 					$SHELL <&- < /dev/tty
 				fi
 			fi
 		fi
 	done
+
+	if test "x$dry_run" = "xyes"; then
+		echo "running: git branch -d ${prefix}base-old"
+	else
+		git branch -d ${prefix}base-old
+	fi
 
 	if ! git_branch_exists ${prefix}master; then
 		if test "x$dry_run" = "xyes"; then
@@ -562,11 +568,26 @@ sync()
 	fi
 
 	if test "x$dry_run" = "xyes"; then
-		echo "running: git rebase --onto ${prefix}master ${prefix}master-old"
+		echo "running: git branch ${prefix}work-new ${prefix}work"
+		echo "running: git reset --hard ${repository}/${remote}work"
+		echo "running: git rebase --onto ${prefix}master ${repository}/${remote}master"
+		echo "running: git rebase --onto ${prefix}work ${prefix}master-old ${prefix}work-new"
+		echo "running: git branch -M ${prefix}work-new ${prefix}work"
+		echo "running: git checkout ${prefix}work"
 	else
-		if ! git rebase --onto ${prefix}master ${prefix}master-old; then
-			$SHELL <$- < /dev/tty
+		git branch ${prefix}work-new ${prefix}work
+		git reset --hard ${repository}/${remote}work
+
+		if ! git rebase --onto ${prefix}master ${repository}/${remote}master; then
+			$SHELL <&- < /dev/tty
 		fi
+
+		if ! git rebase --onto ${prefix}work ${prefix}master-old ${prefix}work-new; then
+			$SHELL <&- < /dev/tty
+		fi
+
+		git branch -M ${prefix}work-new ${prefix}work
+		git checkout ${prefix}work
 	fi
 
 	if test "x$dry_run" = "xyes"; then
